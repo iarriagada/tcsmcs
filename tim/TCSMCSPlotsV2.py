@@ -8,6 +8,7 @@
 
 from collections import namedtuple
 from datetime import datetime, timedelta
+from dateutil import tz
 import argparse
 import sys
 import select
@@ -20,38 +21,48 @@ import matplotlib
 import numpy as np
 import re
 import pytz
+import pdb
 import os
 import time
-from pprint import pprint
+# from pprint import pprint
+
+sys.path.insert(0,'../')
+sys.path.append('..')
+
+from swglib.export import DataManager, get_exporter
 
 plt.rcParams['keymap.save'] = ''
 plt.rcParams['keymap.home'] = ''
 plt.rcParams['keymap.grid'] = ''
 
-# import tkinter as tk
-# from tkinter import ttk
-
-LL_TIME = '20:00:00.0'
-HL_TIME = '23:00:00.0'
-
+TZ = 'America/Santiago'
 PLOT_ZONE_FILE = './zonesV6.cfg'
 LEGEND_LOCATION = 'lower left'
-MARKERSIZE = 2.5
 PLOT_AREA = (10,2)
 BOTTOM_PLOT = True
 
 TCS_SYSTEM = 'tcs'
-TCS_CA = 'tcs:drives:driveMCS.VALI'
+TCS_CA = 'tcs:drives:driveMCS.VALA'
+TCS_CASWG = 'tcs:drives:driveMCS.VALI'
+# TCS_CA = 'tcs:drives:driveMCS.VALI'
 MCS_SYSTEM = 'mcs'
 MCSERR_CA = 'mc:AXISPmacPosError'
 MCSDMD_CA = 'mc:AXISPmacDemandPos'
+MCSCUR_CA = 'mc:AXISCurrentPos'
 GWS_SYSTEM = 'gws'
 GWS_CA = 'ws:tpUaTeSpeed3D'
 WFS_SYSTEM = 'wfs'
 WFS_CA = 'WFS:dc:ttf.VALTIPTILT'
 
-FollowArray = namedtuple(\
-                         'FollowArray',\
+FollowAArray = namedtuple('FollowAArray',\
+                         'timestamp\
+                         now\
+                         targetTime\
+                         trackId\
+                         azPos\
+                         elPos')
+FollowIArray = namedtuple(\
+                         'FollowIArray',\
                          'timestamp\
                          now\
                          traw\
@@ -69,7 +80,7 @@ FollowArray = namedtuple(\
                          azDmd\
                          elDmd'\
                          )
-MCSArray = namedtuple('MCSArray', 'timestamp pmacVal')
+MCSArray = namedtuple('MCSArray', 'timestamp mcsVal')
 GWSArray = namedtuple('GWSArray', 'timestamp windTopEnd')
 WFSArray = namedtuple('WFSArray', 'timestamp wfsTipTilt')
 ZoneArray = namedtuple('ZoneArray', 'title begin end color')
@@ -85,8 +96,6 @@ if SITE == 'cp':
             '/net/cpostonfs-nv1/tier2/gem/sto/archiveRTEMS/tcsmcs/data'
 else:
     raise NotImplementedError("The script hasn't been adapted for MK yet")
-
-DEBUG = False
 
 def parse_args():
     enableDebugDate = "debug"
@@ -108,6 +117,15 @@ def parse_args():
                         metavar='DATE',
                         help='Date to be analized in format YYYY-MM-DD')
 
+    parser.add_argument('-tw',
+                        '--timewindow',
+                        dest='timeWindow',
+                        nargs=2,
+                        default=['18:00:00', '10:00:00'],
+                        metavar=('INIT-TIME','END-TIME'),
+                        help='Time window for the plot\
+                        e.g.: -tw 18:00:00 06:00:00')
+
     parser.add_argument('-day',
                         '--day_mode',
                         dest='day_mode',
@@ -119,15 +137,7 @@ def parse_args():
                         '--zoom',
                         dest='zoom',
                         action='store_true',
-                        help='If used, relevant plots\
-                        will be zoomed in Y-axis')
-
-    parser.add_argument('-cm',
-                        '--ca_monitor',
-                        dest='ca_mon',
-                        action='store_true',
-                        help='use this option if you are analyzing\
-                        data captured with camonitor')
+                        help='If used, plots will be zoomed out in Y-axis')
 
     parser.add_argument('-ax',
                         '--axis',
@@ -150,14 +160,18 @@ def parse_args():
                         e.g.: -tt tilt (Option used with \
                         \'swg\' level of detail only)')
 
-    parser.add_argument('-tw',
-                        '--timewindow',
-                        dest='timeWindow',
-                        nargs=2,
-                        default=['18:00:00', '06:30:00'],
-                        metavar=('INIT-TIME','END-TIME'),
-                        help='Time window for the plot\
-                        e.g.: -tw 18:00:00 06:00:00')
+    parser.add_argument('-cm',
+                        '--ca_monitor',
+                        dest='ca_mon',
+                        action='store_true',
+                        help='use this option if you are analyzing\
+                        data captured with camonitor')
+
+    parser.add_argument('-c',
+                        '--cached_data',
+                        dest='cached_data',
+                        action='store_true',
+                        help='use this option to capture data on the fly')
 
     args = parser.parse_args()
 
@@ -184,6 +198,155 @@ def dataPath(date, day_mode, system, PV):
     )
     return data_path
 
+def fromtimestampTz(ts):
+    timezone = pytz.timezone(TZ)
+    return datetime.fromtimestamp(ts, timezone)
+
+def strptimeTz(dateStr, US=False):
+    timezone = pytz.timezone(TZ)
+    if US:
+        when = datetime.strptime(dateStr, '%m/%d/%Y %H:%M:%S.%f')
+    else:
+        when = datetime.strptime(dateStr, '%Y-%m-%d %H:%M:%S')
+    return timezone.localize(when)
+
+def localizeNp64Tz(np64dt):
+    """
+    Converts from numpy.datetime64 to standard datetime with TZ
+    """
+    ts = ((np64dt - np.datetime64('1970-01-01T00:00:00Z'))
+          / np.timedelta64(1, 's'))
+    return fromtimestampTz(ts)
+
+def producerT(pv, stime, etime):
+    begin = strptimeTz(stime)
+    end = strptimeTz(etime)
+    tot_time = end - begin
+    print 'Times:', begin, end
+    dm = DataManager(get_exporter(SITE.upper()), root_dir='/tmp/rcm/')
+    data = dm.getData(pv, begin, end)
+    print "Processing", pv
+    print "Starting"
+    for val in data:
+        if len(val) < 16:
+            continue
+        recTime = localizeNp64Tz(val[0])
+        receptionTime = datetime.strftime(recTime, '%m/%d/%Y %H:%M:%S.%f')
+        curr_time = datetime.strftime(recTime, '%Y-%m-%d %H:%M:%S')
+        curr_time = strptimeTz(curr_time)
+        receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        span_time = curr_time - begin
+        progress = round((span_time.total_seconds()
+                          / tot_time.total_seconds()) * 100, 2)
+        sys.stdout.write('\r' + 'Progress: ' + str(progress) + '% ')
+        # sys.stdout.write('\r' + 'Progress: ' + str(val) + '% ')
+        sys.stdout.flush()
+        # print "Spanned time:", span_time.total_seconds()
+        yield FollowIArray(receptionTime, val[1], val[2], val[3], val[4],
+                          val[5], val[6], val[7], val[8], val[9], val[10],
+                          val[11], val[12], val[13], val[14], val[15])
+    sys.stdout.write('\r' + 'Progress: 100.00%')
+    sys.stdout.flush()
+    print "\nDONE!"
+
+def producerM(pv, stime, etime):
+    # begin, end = getTimes(dateStr, timeRangeStr)
+    begin = strptimeTz(stime)
+    end = strptimeTz(etime)
+    tot_time = end - begin
+    # begin = stime
+    # end = etime
+    print 'Times:', begin, end
+    dm = DataManager(get_exporter(SITE.upper()), root_dir='/tmp/rcm/')
+    data = dm.getData(pv, begin, end)
+    print "Processing", pv
+    print "Starting"
+    for val in data:
+        if len(val) < 2:
+            continue
+        # receptionTime = localizeNp64Tz(val[0])
+        # receptionTime = datetime.strftime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        # receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        recTime = localizeNp64Tz(val[0])
+        receptionTime = datetime.strftime(recTime, '%m/%d/%Y %H:%M:%S.%f')
+        curr_time = datetime.strftime(recTime, '%Y-%m-%d %H:%M:%S')
+        curr_time = strptimeTz(curr_time)
+        receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        span_time = curr_time - begin
+        progress = round((span_time.total_seconds()
+                          / tot_time.total_seconds()) * 100, 2)
+        sys.stdout.write('\r' + 'Progress: ' + str(progress) + '% ')
+        sys.stdout.flush()
+        yield MCSArray(receptionTime, val[1])
+    sys.stdout.write('\r' + 'Progress: 100.00%')
+    sys.stdout.flush()
+    print "\nDONE!"
+
+def producerG(pv, stime, etime):
+    # begin, end = getTimes(dateStr, timeRangeStr)
+    begin = strptimeTz(stime)
+    end = strptimeTz(etime)
+    tot_time = end - begin
+    # begin = stime
+    # end = etime
+    print 'Times:', begin, end
+    dm = DataManager(get_exporter(SITE.upper()), root_dir='/tmp/rcm/')
+    data = dm.getData(pv, begin, end)
+    print "Processing", pv
+    print "Starting"
+    for val in data:
+        if len(val) < 2:
+            continue
+        # receptionTime = localizeNp64Tz(val[0])
+        # receptionTime = datetime.strftime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        # receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        recTime = localizeNp64Tz(val[0])
+        receptionTime = datetime.strftime(recTime, '%m/%d/%Y %H:%M:%S.%f')
+        curr_time = datetime.strftime(recTime, '%Y-%m-%d %H:%M:%S')
+        curr_time = strptimeTz(curr_time)
+        receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        span_time = curr_time - begin
+        progress = round((span_time.total_seconds()
+                          / tot_time.total_seconds()) * 100, 2)
+        sys.stdout.write('\r' + 'Progress: ' + str(progress) + '% ')
+        sys.stdout.flush()
+        yield GWSArray(receptionTime, val[1])
+    sys.stdout.write('\r' + 'Progress: 100.00%')
+    sys.stdout.flush()
+    print "\nDONE!"
+
+def producerW(pv, stime, etime):
+    # begin, end = getTimes(dateStr, timeRangeStr)
+    begin = strptimeTz(stime)
+    end = strptimeTz(etime)
+    tot_time = end - begin
+    # begin = stime
+    # end = etime
+    print 'Times:', begin, end
+    dm = DataManager(get_exporter(SITE.upper()), root_dir='/tmp/rcm/')
+    data = dm.getData(pv, begin, end)
+    print "Processing", pv
+    print "Starting"
+    for val in data:
+        if len(val) < 2:
+            continue
+        # receptionTime = localizeNp64Tz(val[0])
+        # receptionTime = datetime.strftime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        # receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        recTime = localizeNp64Tz(val[0])
+        receptionTime = datetime.strftime(recTime, '%m/%d/%Y %H:%M:%S.%f')
+        curr_time = datetime.strftime(recTime, '%Y-%m-%d %H:%M:%S')
+        curr_time = strptimeTz(curr_time)
+        receptionTime = datetime.strptime(receptionTime, '%m/%d/%Y %H:%M:%S.%f')
+        span_time = curr_time - begin
+        progress = round((span_time.total_seconds()
+                          / tot_time.total_seconds()) * 100, 2)
+        sys.stdout.write('\r' + 'Progress: ' + str(progress) + '% ')
+        sys.stdout.flush()
+        yield WFSArray(receptionTime, val[1])
+    sys.stdout.write('\r' + 'Progress: 100.00%')
+    sys.stdout.flush()
+    print "\nDONE!"
 
 def producerTCS(filename):
     """
@@ -215,7 +378,7 @@ def producerTCS(filename):
                     continue
                 receptionTime = datetime.strptime(row[0][:-3],\
                                                   '%m/%d/%Y %H:%M:%S.%f')
-            yield FollowArray(\
+            yield FollowIArray(\
                               receptionTime, float(row[rwIdx[0]]),\
                               float(row[rwIdx[1]]), float(row[rwIdx[2]]),\
                               float(row[rwIdx[3]]), float(row[rwIdx[4]]),\
@@ -383,8 +546,9 @@ def plotConfig(ax_lst):
             plt.setp(ax[0].ax.get_xticklabels(), fontsize=9,
                      rotation=30, ha='right')
             ax[0].ax.set_xlim(lowX,highX)
-            h, l = ax[0].ax.get_legend_handles_labels()
-            ax[0].ax.legend(h, l, loc='upper right', bbox_to_anchor=(1, 1), fontsize = 'small')
+            # h, l = ax[0].ax.get_legend_handles_labels()
+            # ax[0].ax.legend(h, l, loc='upper right', bbox_to_anchor=(1, 1), fontsize = 'small')
+            ax[0].ax.legend(loc='upper right', bbox_to_anchor=(1, 1), fontsize = 'small')
 
 class AxPlt:
     '''
@@ -409,7 +573,7 @@ class AxPlt:
         self.dataY = None
 
     def plot_ax(self, ax_lst, position, height, width,
-                data, bottomPlot=False):
+                data, bottomPlot=False, errorLine=False):
         self.dataT, self.dataY = zip(*data)
         if not(self.shareFlag):
             self.ax = plt.subplot2grid(self.plotArea, position,
@@ -424,6 +588,11 @@ class AxPlt:
                                        sharex=self.sharedAx[0])
 
         self.ax.plot(self.dataT, self.dataY, self.linestyle)
+        if errorLine:
+            self.ax.axhline(y=1.0, linestyle='-.', linewidth=1.25, color='crimson')
+            self.ax.axhline(y=0.5, linestyle='-.', linewidth=1.25, color='darkorange')
+            self.ax.axhline(y=-1.0, linestyle='-.', linewidth=1.25, color='crimson')
+            self.ax.axhline(y=-0.5, linestyle='-.', linewidth=1.25, color='darkorange')
         self.ax.grid(True)
         self.ax.tick_params("y", colors="b")
         self.ax.set_ylabel(self.ylabel, color="b")
@@ -469,18 +638,22 @@ def save_zone(event):
             return
         zcol = raw_input("Choose color (r/y/g): ")
         write_zone(zname, zcol, zxlims)
-        i = 0
-        for auxax in ax_lst:
-            auxzone = auxax[0].ax.axvspan(zxlimsDate[0], zxlimsDate[1],
-                                          facecolor=zcol,
-                                          label=zname,
-                                          alpha=0.3)
-            # evZones.append([auxzone])
-            evZones[i].append(auxzone)
-            auxax[0].ax.legend(loc='upper right', bbox_to_anchor=(1, 1),
-                               fontsize = 'small')
-            i += 1
+        remove_zones(evZones)
+        evZones = paint_zones(ax_lst)
+        plotConfig(ax_lst)
         fig.canvas.draw()
+        # i = 0
+        # for auxax in ax_lst:
+            # auxzone = auxax[0].ax.axvspan(zxlimsDate[0], zxlimsDate[1],
+                                          # facecolor=zcol,
+                                          # label=zname,
+                                          # alpha=0.3)
+            # # evZones.append([auxzone])
+            # evZones[i].append(auxzone)
+            # auxax[0].ax.legend(loc='upper right', bbox_to_anchor=(1, 1),
+                               # fontsize = 'small')
+            # i += 1
+        # fig.canvas.draw()
         saveFlag = True
 
 def select_zone(event):
@@ -516,21 +689,6 @@ def enable_event(event):
             ez.set_visible(not(visState))
         fig.canvas.draw()
 
-def removeZones(evZones):
-    # global evZones
-    ezlist = [izone for ezones in evZones for izone in ezones]
-    for ez in ezlist:
-        visState = ez.remove()
-    # fig.canvas.draw()
-
-def write_zone(name, col, xlims):
-    newzone = name + ", " + xlims + ", " + col + "\n"
-    # f = open(PLOT_ZONE_FILE, 'a')
-    with open(PLOT_ZONE_FILE, 'a') as f:
-        f.write(newzone)
-        # f.close()
-    print "Zone saved: ", newzone
-
 def delete_zone(event):
     global fig
     global ax_lst
@@ -547,10 +705,27 @@ def delete_zone(event):
             newlines = [line for line in lines if (line.find(currZones[int(zoneDel)-1].title) == -1)]
             f.writelines(newlines)
             f.truncate()
-        removeZones(evZones)
+        remove_zones(evZones)
         evZones = paint_zones(ax_lst)
         plotConfig(ax_lst)
         fig.canvas.draw()
+
+def hot_keys_ref(event):
+    if (event.key == 'r'):
+        hot_keys_disp()
+
+def remove_zones(evZones):
+    ezlist = [izone for ezones in evZones for izone in ezones]
+    for ez in ezlist:
+        visState = ez.remove()
+
+def write_zone(name, col, xlims):
+    newzone = name + ", " + xlims + ", " + col + "\n"
+    # f = open(PLOT_ZONE_FILE, 'a')
+    with open(PLOT_ZONE_FILE, 'a') as f:
+        f.write(newzone)
+        # f.close()
+    print "Zone saved: ", newzone
 
 def disp_zones(ax_lst):
     currZones = readZonesFromFile(ax_lst[0][0].dataT[0], ax_lst[0][0].dataT[-1])
@@ -571,409 +746,454 @@ def paint_zones(ax_lst):
         evZns.append(addZones(axplt[0].ax, axplt[0].dataT[0], axplt[0].dataT[-1]))
     return evZns
 
+def hot_keys_disp():
+    print '**********************************************'
+    print '** Hot keys quick reference guide'
+    print '** r: Display this quick reference'
+    print '** s: Save current zoom as zone of interest'
+    print '** d: Delete zone of interest'
+    print '** z: Zoom to selected zone of interest'
+    print '** h: Zoom out'
+    print '**********************************************'
 
-# ---------- MAIN ----------
-args = parse_args()
+if __name__ == '__main__':
+# def main():
+    # ---------- MAIN ----------
+    args = parse_args()
 
-# DATA ARRAYS GENERATION SECTION
+    # DATA ARRAYS GENERATION SECTION
 
-# Switches input argument "date" format to match date format from GEA. This
-# doesn't look very elegant, I know...
-dateP = switchDateFormat(args.date, '%Y-%m-%d', '%m/%d/%Y')
+    # Switches input argument "date" format to match date format from GEA. This
+    # doesn't look very elegant, I know...
+    dateP = switchDateFormat(args.date, '%Y-%m-%d', '%m/%d/%Y')
 
-# Set X-axis plot limits
-lowX = datetime.strptime(dateP[1] + ' ' + args.timeWindow[0] + '.0',
-                         '%m/%d/%Y %H:%M:%S.%f')
-highX = datetime.strptime(dateP[1] + ' ' + args.timeWindow[1] + '.0',
-                          '%m/%d/%Y %H:%M:%S.%f')
-startNight = datetime.strptime(dateP[1] + ' ' + '18:00:00.0',
-                               '%m/%d/%Y %H:%M:%S.%f')
+    # Set X-axis plot limits
+    lowX = datetime.strptime(dateP[1] + ' ' + args.timeWindow[0] + '.0',
+                            '%m/%d/%Y %H:%M:%S.%f')
+    highX = datetime.strptime(dateP[1] + ' ' + args.timeWindow[1] + '.0',
+                            '%m/%d/%Y %H:%M:%S.%f')
+    startNight = datetime.strptime(dateP[1] + ' ' + '18:00:00.0',
+                                '%m/%d/%Y %H:%M:%S.%f')
+    midNight = datetime.strptime(dateP[1] + ' ' + '23:59:59.9',
+                                '%m/%d/%Y %H:%M:%S.%f')
 
-# Checks to see if X-axis low limit falls after midnight and corrects date.
-if not(args.day_mode):
-    if lowX < startNight:
-        lowX = lowX + timedelta(days=1)
-    # Checks to see if X-axis high limit falls after midnight and corrects date.
-    if highX < lowX:
-        highX = highX + timedelta(days=1)
-else:
-    auxX = lowX
-    lowX = highX
-    highX = auxX
+    # Checks to see if X-axis low limit falls after midnight and corrects date.
+    if not(args.day_mode):
+        if (lowX < startNight) and not(args.cached_data):
+            lowX = lowX + timedelta(days=1)
+        # Checks to see if X-axis high limit falls after midnight and corrects date.
+        if highX < lowX:
+            highX = highX + timedelta(days=1)
+    else:
+        auxX = lowX
+        lowX = highX
+        highX = auxX
 
-# Start of TCS data management
-tcs_data_path = dataPath(args.date, args.day_mode, TCS_SYSTEM, TCS_CA)
-print "Reading: {0}".format(tcs_data_path)
-flw_producer = producerTCS(tcs_data_path)
+    lowX_cache = datetime.strftime(lowX,'%Y-%m-%d %H:%M:%S')
+    highX_cache = datetime.strftime(highX,'%Y-%m-%d %H:%M:%S')
 
+    # Start of TCS data management
+    tcs_data_path = dataPath(args.date, args.day_mode, TCS_SYSTEM, TCS_CA)
+    print "Reading: {0}".format(tcs_data_path)
+    # flw_producer = producerTCS(tcs_data_path)
+    if args.detail in ['swg']:
+        flw_producer = producerT(TCS_CASWG, lowX_cache, highX_cache)
+    else:
+        flw_producer = producerT(TCS_CASWG, lowX_cache, highX_cache)
+        # flw_producer = producerT(TCS_CA, lowX_cache, highX_cache)
 
-diff_lst = list()
-exec_lst = list()
-dDmdAz_lst = list()
-dDmdEl_lst = list()
-vDmdAz_lst = list()
-vDmdEl_lst = list()
-dmdAz_lst = list()
-dmdEl_lst = list()
-corr_lst = list()
-flt_lst = list()
-dmdC_lst = list()
-applyDt_lst = list()
-sendDt_lst = list()
-dtfl_lst = list()
-
-prevElDmd = flw_producer.next().elDmd
-prevAzDmd = flw_producer.next().azDmd
-prevCorrCnt = flw_producer.next().corrCnt
-prevDmdCnt = flw_producer.next().dmdCnt
-# prevFltCnt = flw_producer.next().fltCnt
-
-outliersInPeriod = 0
-periodLimits = Limits(-1,1)
+    # print 'Done with {0}'.format(TCS_CA)
 
 
+    diff_lst = list()
+    exec_lst = list()
+    dDmdAz_lst = list()
+    dDmdEl_lst = list()
+    vDmdAz_lst = list()
+    vDmdEl_lst = list()
+    dmdAz_lst = list()
+    dmdEl_lst = list()
+    corr_lst = list()
+    flt_lst = list()
+    dmdC_lst = list()
+    applyDt_lst = list()
+    sendDt_lst = list()
+    dtGTRD_lst = list()
 
-for dp in flw_producer:
-    dElDemands = dp.elDmd - prevElDmd
-    dAzDemands = dp.azDmd - prevAzDmd
-    dCorrCnt = dp.corrCnt - prevCorrCnt
-    dDmdCnt = dp.dmdCnt - prevDmdCnt
-    # dFltCnt = dp.fltCnt - prevFltCnt
+    prevElDmd = flw_producer.next().elDmd
+    prevAzDmd = flw_producer.next().azDmd
+    prevCorrCnt = flw_producer.next().corrCnt
+    prevDmdCnt = flw_producer.next().dmdCnt
+    prevFltCnt = flw_producer.next().fltCnt
 
-    # if dDmdCnt > 1 and ( dCorrCnt == 0  or dFltCnt == 0):
-    if ( dDmdCnt > 1 ) and ( dCorrCnt == 0 ):
-        dAzDemands = dAzDemands / 2
-        dElDemands = dElDemands / 2
+    outliersInPeriod = 0
+    periodLimits = Limits(-1,1)
 
-    diff_lst.append((dp.timestamp, dp.dtraw*1000.0))
-    exec_lst.append((dp.timestamp, dp.dtick*1000.0))
-    dDmdEl_lst.append((dp.timestamp, dElDemands*3600))
-    dDmdAz_lst.append((dp.timestamp, dAzDemands*3600))
 
-    if dp.dtraw > 0:
-        vAzDemands = dAzDemands / dp.dtraw
-        vElDemands = dElDemands / dp.dtraw
-        vDmdAz_lst.append((dp.timestamp, vAzDemands*3600))
-        vDmdEl_lst.append((dp.timestamp, vElDemands*3600))
 
-    applyDt_lst.append((dp.timestamp, dp.applyDT*1000.0))
-    # dtfl_lst.append((dp.timestamp, dp.fltTime*1000.0))
-    corr_lst.append((dp.timestamp, dCorrCnt))
-    dmdC_lst.append((dp.timestamp, dDmdCnt))
-    dmdEl_lst.append((dp.timestamp, dp.elDmd))
-    dmdAz_lst.append((dp.timestamp, dp.azDmd))
-    prevElDmd = dp.elDmd
-    prevAzDmd = dp.azDmd
-    prevCorrCnt = dp.corrCnt
-    prevDmdCnt = dp.dmdCnt
+    for dp in flw_producer:
+        dElDemands = dp.elDmd - prevElDmd
+        dAzDemands = dp.azDmd - prevAzDmd
+        dCorrCnt = dp.corrCnt - prevCorrCnt
+        dDmdCnt = dp.dmdCnt - prevDmdCnt
+        dFltCnt = dp.fltCnt - prevFltCnt
 
-    if dp.dtraw > periodLimits.upper\
-            or\
-            dp.traw < periodLimits.lower:
-        print "Period out of limits: {0} on date: {1}".format(\
-                                                              dp.dtraw,\
-                                                              dp.timestamp\
-                                                              )
-        outliersInPeriod += 1
+        # if dDmdCnt > 1 and ( dCorrCnt == 0  or dFltCnt == 0):
+        if ( dDmdCnt > 1 ) and ( dCorrCnt == 0 ):
+            dAzDemands = dAzDemands / 2
+            dElDemands = dElDemands / 2
 
-# Start of MCS, GWS, WFS data management. This checks the input arguments
-# corresponding to each system
-if args.axis in ['az', 'all']:
-    # Start of MCS data
-    mcsAz_lst = list()
-    PV = MCSERR_CA
-    PV = PV.replace('AXIS','az')
+        diff_lst.append((dp.timestamp, dp.dtraw*1000.0))
+        exec_lst.append((dp.timestamp, dp.dtick*1000.0))
+        dDmdEl_lst.append((dp.timestamp, dElDemands*3600))
+        dDmdAz_lst.append((dp.timestamp, dAzDemands*3600))
 
-    mcsAz_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
-    print "Reading: {0}".format(mcsAz_data_path)
-    mcs_producer = producerMCS(mcsAz_data_path)
-    for dp in mcs_producer:
-        mcsAz_lst.append((dp.timestamp, dp.pmacVal*3600))
+        if dp.dtraw > 0:
+            vAzDemands = dAzDemands / dp.dtraw
+            vElDemands = dElDemands / dp.dtraw
+            vDmdAz_lst.append((dp.timestamp, vAzDemands*3600))
+            vDmdEl_lst.append((dp.timestamp, vElDemands*3600))
 
-    if args.detail in ['medp']:
-        mcsDmdAz_lst = list()
-        PV = MCSDMD_CA
+        applyDt_lst.append((dp.timestamp, dp.applyDT*1000.0))
+        # dtfl_lst.append((dp.timestamp, dp.fltTime*1000.0))
+        corr_lst.append((dp.timestamp, dCorrCnt))
+        flt_lst.append((dp.timestamp, dFltCnt))
+        dtGTRD_lst.append((dp.timestamp, dp.dtGetTelRD))
+        dmdC_lst.append((dp.timestamp, dDmdCnt))
+        dmdEl_lst.append((dp.timestamp, dp.elDmd))
+        dmdAz_lst.append((dp.timestamp, dp.azDmd))
+        prevElDmd = dp.elDmd
+        prevAzDmd = dp.azDmd
+        prevCorrCnt = dp.corrCnt
+        prevFltCnt = dp.fltCnt
+        prevDmdCnt = dp.dmdCnt
+
+        # if dp.dtraw > periodLimits.upper\
+                # or\
+                # dp.traw < periodLimits.lower:
+            # print "Period out of limits: {0} on date: {1}".format(\
+                                                                # dp.dtraw,\
+                                                                # dp.timestamp\
+                                                                # )
+            # outliersInPeriod += 1
+
+    print dp.timestamp
+
+    # Start of MCS, GWS, WFS data management. This checks the input arguments
+    # corresponding to each system
+    if args.axis in ['az', 'all']:
+        # Start of MCS data
+        mcsAz_lst = list()
+        PV = MCSERR_CA
         PV = PV.replace('AXIS','az')
 
-        mcsAz_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
-        print "Reading: {0}".format(mcsAz_data_path)
-        mcs_producer = producerMCS(mcsAz_data_path)
+        # mcsAz_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
+        # print "Reading: {0}".format(mcsAz_data_path)
+        # mcs_producer = producerMCS(mcsAz_data_path)
+        mcs_producer = producerM(PV, lowX_cache, highX_cache)
         for dp in mcs_producer:
-            mcsDmdAz_lst.append((dp.timestamp, dp.pmacVal))
+            mcsAz_lst.append((dp.timestamp, dp.mcsVal*3600))
 
-if args.axis in ['el', 'all']:
-    # Start of MCS data
-    mcsEl_lst = list()
-    PV = MCSERR_CA
-    PV = PV.replace('AXIS','el')
+        mcsAz_lst = mcsAz_lst[:-1]
+        if args.detail in ['medp']:
+            mcsDmdAz_lst = list()
+            PV = MCSDMD_CA
+            PV = PV.replace('AXIS','az')
 
-    mcsEl_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
-    print "Reading: {0}".format(mcsEl_data_path)
-    mcs_producer = producerMCS(mcsEl_data_path)
-    for dp in mcs_producer:
-        mcsEl_lst.append((dp.timestamp, dp.pmacVal*3600))
+            # mcsAz_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
+            # print "Reading: {0}".format(mcsAz_data_path)
+            # mcs_producer = producerMCS(mcsAz_data_path)
+            mcs_producer = producerM(PV, lowX_cache, highX_cache)
+            for dp in mcs_producer:
+                mcsDmdAz_lst.append((dp.timestamp, dp.mcsVal))
 
-    if args.detail in ['medp']:
-        mcsDmdEl_lst = list()
-        PV = MCSDMD_CA
+    if ((args.axis in ['el', 'all']) and not(args.detail in ['swg']))\
+    or ((args.axis in ['el']) and (args.detail in ['swg'])):
+        # Start of MCS data
+        mcsEl_lst = list()
+        PV = MCSERR_CA
         PV = PV.replace('AXIS','el')
 
-        mcsEl_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
-        print "Reading: {0}".format(mcsEl_data_path)
-        mcs_producer = producerMCS(mcsEl_data_path)
+        # mcsEl_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
+        # print "Reading: {0}".format(mcsEl_data_path)
+        # mcs_producer = producerMCS(mcsEl_data_path)
+        mcs_producer = producerM(PV, lowX_cache, highX_cache)
         for dp in mcs_producer:
-            mcsDmdEl_lst.append((dp.timestamp, dp.pmacVal))
+            mcsEl_lst.append((dp.timestamp, dp.mcsVal*3600))
 
-if args.detail in ['high']:
-    # Start of GWS data
-    gws_lst = list()
-    gws_data_path = dataPath(args.date, args.day_mode, GWS_SYSTEM, GWS_CA)
-    print "Reading: {0}".format(gws_data_path)
-    gws_producer = producerGWS(gws_data_path)
-    for dp in gws_producer:
-        gws_lst.append((dp.timestamp, dp.windTopEnd))
-
-if args.detail in ['medw', 'high']:
-    # Start of WFS data
-    wfsA_lst = list()
-    wfsB_lst = list()
-    PV = WFS_CA
-
-    if args.wfs in ['p1']:
-        PV = PV.replace('WFS','pwfs1')
-    elif args.wfs in ['p2']:
-        PV = PV.replace('WFS','pwfs2')
-    elif args.wfs in ['oi']:
-        PV = PV.replace('WFS','oiwfs')
-
-    if args.tt in ['tip', 'all']:
-        PV = PV.replace('TIPTILT','A')
-        wfsA_data_path = dataPath(args.date, args.day_mode, WFS_SYSTEM, PV)
-        print "Reading: {0}".format(wfsA_data_path)
-        wfs_producer = producerWFS(wfsA_data_path)
-        for dp in wfs_producer:
-            wfsA_lst.append((dp.timestamp, dp.wfsTipTilt))
-        PV = PV.replace('VALA','VALTIPTILT')
-
-    if args.tt in ['tilt', 'all']:
-        PV = PV.replace('TIPTILT','B')
-        wfsB_data_path = dataPath(args.date, args.day_mode, WFS_SYSTEM, PV)
-        print "Reading: {0}".format(wfsB_data_path)
-        wfs_producer = producerWFS(wfsB_data_path)
-        for dp in wfs_producer:
-            wfsB_lst.append((dp.timestamp, dp.wfsTipTilt))
-
-
-# PLOTTING SECTION
-print "**********"
-print "Generating Plots..."
-
-fig = plt.figure()
-zxlims = '' # Variable initialization for Zones x-axis limits
-zxlimsDate = [] # Variable initialization for Zones x-axis limits
-saveFlag = True #Flag to enable/disable saving plot zooms
-AxPlt.plotArea = PLOT_AREA
-
-# Define Y-Label text for several plots
-# Define label for mount axis
-ElTitle = 'Elevation'
-AzTitle = 'Azimuth'
-
-# Define label for WFS
-if (args.wfs == 'p1'):
-    wfsTitle = 'Pwfs1'
-elif (args.wfs == 'p2'):
-    wfsTitle = 'Pwfs2'
-elif (args.wfs == 'oi'):
-    wfsTitle = 'Oiwfs'
-
-wfsTitleA = wfsTitle + ' tip'
-wfsTitleB = wfsTitle + ' tilt'
-
-# Initialize plots
-# Set Y-axis zoom limits
-autoyax = True
-dmdYLim = (0,0)
-pmacYLim = (0,0)
-wfsYLim = (0,0)
-
-timeYLim = (-50, 150)
-cntYLim = (0, 4)
-appDtYLim = (-10, 200)
-
-if (args.zoom):
-    autoyax = False
-    dmdYLim = (-10,10)
-    pmacYLim = (-15,15)
-    wfsYLim = (-0.5,0.5)
-
-# Initialize TCS Time plots
-tcsDTraw = AxPlt('r-', "Diff traw\n[ms]", timeYLim, False)
-tcsDTick = AxPlt('r-', "Diff tick\n[ms]", timeYLim, False)
-tcsAppTime = AxPlt('r-', "Tick - Traw\n[ms]", timeYLim, False)
-tcsDCorrCnt = AxPlt('r-', "Diff\nCorr Cnt\n[un]", cntYLim, False)
-tcsDDmdCnt = AxPlt('r-', "Diff\nDmd Cnt\n[un]", cntYLim, False)
-
-# Initialize Az plots
-tcsAzDmd = AxPlt('g-', "{0} Demand\n[degrees]".format(AzTitle))
-tcsAzdDmd = AxPlt('g-', "Diff\n{0} Demand\n[arcsec]".format(AzTitle), dmdYLim, autoyax)
-mcsAzPmErr = AxPlt('r-', "{0}\nPmac Error\n[arcsec]".format(AzTitle), pmacYLim, autoyax)
-mcsAzPmDmd = AxPlt('r-', "{0}\nPmac Demand\n[arcsec]".format(AzTitle), pmacYLim, autoyax)
-
-# Initialize El plots
-tcsElDmd = AxPlt('g-', "{0} Demand\n[degress]".format(ElTitle))
-tcsEldDmd = AxPlt('g-', "Diff\n{0} Demand\n[arcsec]".format(ElTitle), dmdYLim, autoyax)
-mcsElPmErr = AxPlt('r-', "{0}\nPmac Error\n[arcsec]".format(ElTitle), pmacYLim, autoyax)
-mcsElPmDmd = AxPlt('r-', "{0}\nPmac Demand\n[arcsec]".format(ElTitle), pmacYLim, autoyax)
-
-# Initialize WFS plots
-wfsTip = AxPlt('b-', "{0}\n[arcsec]".format(wfsTitleA), wfsYLim, autoyax)
-wfsTilt = AxPlt('b-', "{0}\n[arcsec]".format(wfsTitleB), wfsYLim, autoyax)
-
-# Initialize Wind plot
-gwsWind = AxPlt('g-', "Wind Speed\nTop End\n[m/s]")
-
-# Layout settings
-# In case the reader wants to generate their own plotting scheme, the setup
-# needs to follow this simple structure
-# NAME_OF_PLOT_OBJECT.plot.ax([position parameters]+[data list])
-# The order in wich the plots are called on the script is the plot number. The
-# function plot_ax puts its own plot object in a list, which can then be used
-# to iteratively access each plot object.
-
-ax_lst = list() # Initialize plot axis list
-
-# Detail level Low
-if args.detail in ['low']:
-    AxPlt.plotArea = (4,2)
-    if args.axis in ['az','all']:
-        cs = 1
-        if args.axis in ['az']:
-            cs = 2
-        mcsAzPmErr.plot_ax(ax_lst, (0,0), 1, cs, mcsAz_lst)
-        tcsAzdDmd.plot_ax(ax_lst, (1,0), 1, cs, dDmdAz_lst)
-        tcsAzDmd.plot_ax(ax_lst, (2,0), 2, cs, dmdAz_lst, BOTTOM_PLOT)
-
-    if args.axis in ['el','all']:
-        cs = 1
-        cp = 1
-        if args.axis in ['el']:
-            cs = 2
-            cp = 0
-        mcsElPmErr.plot_ax(ax_lst, (0,cp), 1, cs, mcsEl_lst)
-        tcsEldDmd.plot_ax(ax_lst, (1,cp), 1, cs, dDmdEl_lst)
-        tcsElDmd.plot_ax(ax_lst, (2,cp), 2, cs, dmdEl_lst, BOTTOM_PLOT)
-
-# Detail level Med and High
-if args.detail in ['medw', 'medp', 'high']:
-    AxPlt.plotArea = (6,2) # Define plotting area
-    p0index = 0
-    p1index = 0
-    rs = 3
-    p1step = 3
-    bottomR = False
-    bottomL = False
-    if args.axis in ['az','all']:
-        # Change conditions if only Az axis has been requested
-        if args.axis in ['az']:
-            AxPlt.plotArea = (4,2) # Define plotting area
-            rs = 4
-            if args.detail in ['medp']:
-                AxPlt.plotArea = (3,2) # Define plotting area
-                rs = 3
-                bottomL = True
-            bottomR = True
         if args.detail in ['medp']:
-            mcsAzPmDmd.plot_ax(ax_lst, (p0index,0), 1, 1, mcsDmdAz_lst)
-            p0index += 1
-        mcsAzPmErr.plot_ax(ax_lst, (p0index,0), 1, 1, mcsAz_lst)
-        p0index += 1
-        tcsAzdDmd.plot_ax(ax_lst, (p0index,0), 1, 1, dDmdAz_lst, bottomL)
-        p0index += 1
-        # Add Wind information in case plot detail set to High
-        if args.detail in ['high']:
-            rs = 2
-            p1step = 2
-            gwsWind.plot_ax(ax_lst, (p1index,1), rs, 1, gws_lst)
-            p1index += p1step
-        tcsAzDmd.plot_ax(ax_lst, (p1index,1), rs, 1, dmdAz_lst, bottomR)
-        p1index += p1step
+            mcsDmdEl_lst = list()
+            PV = MCSDMD_CA
+            PV = PV.replace('AXIS','el')
 
-    if args.axis in ['el','all']:
-        # Change conditions if only El axis has been requested
-        if args.axis in ['el']:
-            AxPlt.plotArea = (4,2) # Define plotting area
-            rs = 4
+            # mcsEl_data_path = dataPath(args.date, args.day_mode, MCS_SYSTEM, PV)
+            # print "Reading: {0}".format(mcsEl_data_path)
+            # mcs_producer = producerMCS(mcsEl_data_path)
+            mcs_producer = producerM(PV, lowX_cache, highX_cache)
+            for dp in mcs_producer:
+                mcsDmdEl_lst.append((dp.timestamp, dp.mcsVal))
+
+    if args.detail in ['high', 'swg']:
+        # Start of GWS data
+        gws_lst = list()
+        # gws_data_path = dataPath(args.date, args.day_mode, GWS_SYSTEM, GWS_CA)
+        # print "Reading: {0}".format(gws_data_path)
+        # gws_producer = producerGWS(gws_data_path)
+        gws_producer = producerG(GWS_CA, lowX_cache, highX_cache)
+        for dp in gws_producer:
+            gws_lst.append((dp.timestamp, dp.windTopEnd))
+
+    if args.detail in ['medw', 'high']:
+        # Start of WFS data
+        wfsA_lst = list()
+        wfsB_lst = list()
+        PV = WFS_CA
+
+        if args.wfs in ['p1']:
+            PV = PV.replace('WFS','pwfs1')
+        elif args.wfs in ['p2']:
+            PV = PV.replace('WFS','pwfs2')
+        elif args.wfs in ['oi']:
+            PV = PV.replace('WFS','oiwfs')
+
+        if args.tt in ['tip', 'all']:
+            PV = PV.replace('TIPTILT','A')
+            # wfsA_data_path = dataPath(args.date, args.day_mode, WFS_SYSTEM, PV)
+            # print "Reading: {0}".format(wfsA_data_path)
+            # wfs_producer = producerWFS(wfsA_data_path)
+            wfs_producer = producerW(PV, lowX_cache, highX_cache)
+            for dp in wfs_producer:
+                wfsA_lst.append((dp.timestamp, dp.wfsTipTilt))
+            PV = PV.replace('VALA','VALTIPTILT')
+
+        if args.tt in ['tilt', 'all']:
+            PV = PV.replace('TIPTILT','B')
+            # wfsB_data_path = dataPath(args.date, args.day_mode, WFS_SYSTEM, PV)
+            # print "Reading: {0}".format(wfsB_data_path)
+            # wfs_producer = producerWFS(wfsB_data_path)
+            wfs_producer = producerW(PV, lowX_cache, highX_cache)
+            for dp in wfs_producer:
+                wfsB_lst.append((dp.timestamp, dp.wfsTipTilt))
+
+
+    # PLOTTING SECTION
+    print "**********"
+    print "Generating Plots..."
+    print "**********"
+    hot_keys_disp()
+
+    fig = plt.figure()
+    zxlims = '' # Variable initialization for Zones x-axis limits
+    zxlimsDate = [] # Variable initialization for Zones x-axis limits
+    saveFlag = True #Flag to enable/disable saving plot zooms
+    AxPlt.plotArea = PLOT_AREA
+
+    # Define Y-Label text for several plots
+    # Define label for mount axis
+    ElTitle = 'Elevation'
+    AzTitle = 'Azimuth'
+
+    # Define label for WFS
+    if (args.wfs == 'p1'):
+        wfsTitle = 'Pwfs1'
+    elif (args.wfs == 'p2'):
+        wfsTitle = 'Pwfs2'
+    elif (args.wfs == 'oi'):
+        wfsTitle = 'Oiwfs'
+
+    wfsTitleA = wfsTitle + ' tip'
+    wfsTitleB = wfsTitle + ' tilt'
+
+    # Initialize plots
+    # Set Y-axis zoom limits
+    autoyax = True
+    dmdYLim = (0,0)
+    pmacYLim = (0,0)
+    wfsYLim = (0,0)
+
+    timeYLim = (-50, 150)
+    cntYLim = (0, 4)
+    appDtYLim = (-10, 200)
+
+    if not(args.zoom):
+        autoyax = False
+        dmdYLim = (-10,10)
+        pmacYLim = (-15,15)
+        wfsYLim = (-0.5,0.5)
+
+    # Initialize TCS Time plots
+    tcsDTraw = AxPlt('r.-', "Diff traw\n[ms]", timeYLim, False)
+    tcsDTick = AxPlt('r.-', "Diff tick\n[ms]", timeYLim, False)
+    tcsAppTime = AxPlt('r.-', "Tick - Traw\n[ms]", timeYLim, False)
+    tcsDCorrCnt = AxPlt('r.-', "Diff\nCorr Cnt\n[un]", cntYLim, False)
+    tcsDDmdCnt = AxPlt('r.-', "Diff\nDmd Cnt\n[un]", cntYLim, False)
+    tcsFltCnt = AxPlt('r.-', "Diff\nFault Cnt\n[un]", cntYLim, False)
+    tcsGetTelRD = AxPlt('r.-', "Diff\nGetTelRaDec\nExecution\n[ms]")
+
+    # Initialize Az plots
+    tcsAzDmd = AxPlt('g-', "{0} Demand\n[degrees]".format(AzTitle))
+    tcsAzdDmd = AxPlt('g-', "Diff\n{0} Demand\n[arcsec]".format(AzTitle), dmdYLim, autoyax)
+    mcsAzPmErr = AxPlt('b-', "{0}\nPmac Error\n[arcsec]".format(AzTitle), pmacYLim, autoyax)
+    mcsAzPmDmd = AxPlt('b-', "{0}\nPmac Demand\n[degrees]".format(AzTitle))
+
+    # Initialize El plots
+    tcsElDmd = AxPlt('g-', "{0} Demand\n[degress]".format(ElTitle))
+    tcsEldDmd = AxPlt('g-', "Diff\n{0} Demand\n[arcsec]".format(ElTitle), dmdYLim, autoyax)
+    mcsElPmErr = AxPlt('b-', "{0}\nPmac Error\n[arcsec]".format(ElTitle), pmacYLim, autoyax)
+    mcsElPmDmd = AxPlt('b-', "{0}\nPmac Demand\n[degrees]".format(ElTitle))
+
+    # Initialize WFS plots
+    wfsTip = AxPlt('b-', "{0}\n[arcsec]".format(wfsTitleA), wfsYLim, autoyax)
+    wfsTilt = AxPlt('b-', "{0}\n[arcsec]".format(wfsTitleB), wfsYLim, autoyax)
+
+    # Initialize Wind plot
+    gwsWind = AxPlt('g-', "Wind Speed\nTop End\n[m/s]")
+
+    # Layout settings
+    # In case the reader wants to generate their own plotting scheme, the setup
+    # needs to follow this simple structure
+    # NAME_OF_PLOT_OBJECT.plot.ax([position parameters]+[data list])
+    # The order in wich the plots are called on the script is the plot number. The
+    # function plot_ax puts its own plot object in a list, which can then be used
+    # to iteratively access each plot object.
+
+    ax_lst = list() # Initialize plot axis list
+
+    # Detail level Low
+    if args.detail in ['low']:
+        AxPlt.plotArea = (4,2)
+        if args.axis in ['az','all']:
+            cs = 1
+            if args.axis in ['az']:
+                cs = 2
+            mcsAzPmErr.plot_ax(ax_lst, (0,0), 1, cs, mcsAz_lst, errorLine=True)
+            tcsAzdDmd.plot_ax(ax_lst, (1,0), 1, cs, dDmdAz_lst)
+            tcsAzDmd.plot_ax(ax_lst, (2,0), 2, cs, dmdAz_lst, BOTTOM_PLOT)
+
+        if args.axis in ['el','all']:
+            cs = 1
+            cp = 1
+            if args.axis in ['el']:
+                cs = 2
+                cp = 0
+            mcsElPmErr.plot_ax(ax_lst, (0,cp), 1, cs, mcsEl_lst, errorLine=True)
+            tcsEldDmd.plot_ax(ax_lst, (1,cp), 1, cs, dDmdEl_lst)
+            tcsElDmd.plot_ax(ax_lst, (2,cp), 2, cs, dmdEl_lst, BOTTOM_PLOT)
+
+    # Detail level Med and High
+    if args.detail in ['medw', 'medp', 'high']:
+        AxPlt.plotArea = (6,2) # Define plotting area
+        p0index = 0
+        p1index = 0
+        rs = 3
+        p1step = 3
+        bottomR = False
+        bottomL = False
+        if args.axis in ['az','all']:
+            # Change conditions if only Az axis has been requested
+            if args.axis in ['az']:
+                AxPlt.plotArea = (4,2) # Define plotting area
+                rs = 4
+                if args.detail in ['medp']:
+                    AxPlt.plotArea = (3,2) # Define plotting area
+                    rs = 3
+                    bottomL = True
+                bottomR = True
             if args.detail in ['medp']:
-                AxPlt.plotArea = (3,2) # Define plotting area
-                rs = 3
-                bottomL = True
-        if args.detail in ['medp']:
-            mcsElPmDmd.plot_ax(ax_lst, (p0index,0), 1, 1, mcsDmdEl_lst)
+                mcsAzPmDmd.plot_ax(ax_lst, (p0index,0), 1, 1, mcsDmdAz_lst)
+                p0index += 1
+            mcsAzPmErr.plot_ax(ax_lst, (p0index,0), 1, 1, mcsAz_lst, errorLine=True)
             p0index += 1
-        mcsElPmErr.plot_ax(ax_lst, (p0index,0), 1, 1, mcsEl_lst)
-        p0index += 1
-        tcsEldDmd.plot_ax(ax_lst, (p0index,0), 1, 1, dDmdEl_lst, bottomL)
-        p0index += 1
-        # Add Wind information in case plot detail set to High
-        # P1index is used to determine if Wind has already been used
-        if (args.detail in ['high']) and (p1index == 0):
-            rs = 2
-            p1step = 2
-            gwsWind.plot_ax(ax_lst, (p1index,1), rs, 1, gws_lst)
+            tcsAzdDmd.plot_ax(ax_lst, (p0index,0), 1, 1, dDmdAz_lst, bottomL)
+            p0index += 1
+            # Add Wind information in case plot detail set to High
+            if args.detail in ['high']:
+                rs = 2
+                p1step = 2
+                gwsWind.plot_ax(ax_lst, (p1index,1), rs, 1, gws_lst)
+                p1index += p1step
+            tcsAzDmd.plot_ax(ax_lst, (p1index,1), rs, 1, dmdAz_lst, bottomR)
             p1index += p1step
-        tcsElDmd.plot_ax(ax_lst, (p1index,1), rs, 1, dmdEl_lst, BOTTOM_PLOT)
 
-    if args.detail in ['medw']:
-        wfsTip.plot_ax(ax_lst, (p0index,0), 1, 1, wfsA_lst)
-        p0index += 1
-        wfsTilt.plot_ax(ax_lst, (p0index,0), 1, 1, wfsB_lst, BOTTOM_PLOT)
+        if args.axis in ['el','all']:
+            # Change conditions if only El axis has been requested
+            if args.axis in ['el']:
+                AxPlt.plotArea = (4,2) # Define plotting area
+                rs = 4
+                if args.detail in ['medp']:
+                    AxPlt.plotArea = (3,2) # Define plotting area
+                    rs = 3
+            if args.detail in ['medp']:
+                bottomL = True
+                mcsElPmDmd.plot_ax(ax_lst, (p0index,0), 1, 1, mcsDmdEl_lst)
+                p0index += 1
+            mcsElPmErr.plot_ax(ax_lst, (p0index,0), 1, 1, mcsEl_lst, errorLine=True)
+            p0index += 1
+            tcsEldDmd.plot_ax(ax_lst, (p0index,0), 1, 1, dDmdEl_lst, bottomL)
+            p0index += 1
+            # Add Wind information in case plot detail set to High
+            # P1index is used to determine if Wind has already been used
+            if (args.detail in ['high']) and (p1index == 0):
+                rs = 2
+                p1step = 2
+                gwsWind.plot_ax(ax_lst, (p1index,1), rs, 1, gws_lst)
+                p1index += p1step
+            tcsElDmd.plot_ax(ax_lst, (p1index,1), rs, 1, dmdEl_lst, BOTTOM_PLOT)
 
-# Detail Level SWG
-if args.detail in ['swg']:
-    AxPlt.plotArea = (10,2) # Define plotting area
-    p0index = 0
-    p1index = 0
-    rs = 3
-    p1step = 3
-    tcsDTraw.plot_ax(ax_lst, (0,0), 1, 2, diff_lst)
-    tcsDTick.plot_ax(ax_lst, (2,0), 1, 2, exec_lst)
-    tcsDCorrCnt.plot_ax(ax_lst, (4,0), 1, 2, corr_lst)
-    tcsDDmdCnt.plot_ax(ax_lst, (6,0), 1, 2, dmdC_lst)
-    tcsAppTime.plot_ax(ax_lst, (8,0), 1, 2, applyDt_lst)
-    gwsWind.plot_ax(ax_lst, (10,0), 1, 2, gws_lst, BOTTOM_PLOT)
+        if args.detail in ['medw', 'high']:
+            wfsTip.plot_ax(ax_lst, (p0index,0), 1, 1, wfsA_lst)
+            p0index += 1
+            wfsTilt.plot_ax(ax_lst, (p0index,0), 1, 1, wfsB_lst, BOTTOM_PLOT)
+
+    # Detail Level SWG
+    if args.detail in ['swg']:
+        AxPlt.plotArea = (10,2) # Define plotting area
+        tcsDTraw.plot_ax(ax_lst, (0,0), 2, 1, diff_lst)
+        tcsDTick.plot_ax(ax_lst, (2,0), 2, 1, exec_lst)
+        tcsAppTime.plot_ax(ax_lst, (4,0), 2, 1, applyDt_lst)
+        tcsGetTelRD.plot_ax(ax_lst, (6,0), 1, 1, dtGTRD_lst)
+        tcsDCorrCnt.plot_ax(ax_lst, (7,0), 1, 1, corr_lst)
+        tcsDDmdCnt.plot_ax(ax_lst, (8,0), 1, 1, dmdC_lst)
+        tcsFltCnt.plot_ax(ax_lst, (9,0), 1, 1, flt_lst, BOTTOM_PLOT)
+        gwsWind.plot_ax(ax_lst, (0,1), 2, 1, gws_lst)
+        if args.axis in ['az', 'all']:
+            mcsAzPmErr.plot_ax(ax_lst, (2,1), 2, 1, mcsAz_lst, errorLine=True)
+            tcsAzdDmd.plot_ax(ax_lst, (4,1), 2, 1, dDmdAz_lst)
+            tcsAzDmd.plot_ax(ax_lst, (6,1), 4, 1, dmdAz_lst, BOTTOM_PLOT)
+        else:
+            mcsElPmErr.plot_ax(ax_lst, (2,1), 2, 1, mcsEl_lst, errorLine=True)
+            tcsEldDmd.plot_ax(ax_lst, (4,1), 2, 1, dDmdEl_lst)
+            tcsElDmd.plot_ax(ax_lst, (6,1), 4, 1, dmdEl_lst, BOTTOM_PLOT)
 
 
-print "Plotting window time limits"
-print lowX
-print highX
-print "Number of detected period outliers: {0}".format(outliersInPeriod)
 
-evZones = []
-# for axplt in ax_lst:
-    # evZones.append(addZones(axplt[0].ax, axplt[0].dataT[0], axplt[0].dataT[-1]))
+    print "Plotting window time limits"
+    print lowX
+    print highX
+    print "Number of detected period outliers: {0}".format(outliersInPeriod)
 
-evZones = paint_zones(ax_lst)
+    evZones = []
+    evZones = paint_zones(ax_lst)
 
-# Configure axis format and labels for every plot
-plotConfig(ax_lst)
+    # Configure axis format and labels for every plot
+    plotConfig(ax_lst)
 
-plt.suptitle('TCS-MCS Analysis Plots\nDate: {0} - Detail Level: {1}'.format(
-    args.date, args.detail))
+    plt.suptitle('TCS-MCS Analysis Plots\nDate: {0} - Detail Level: {1}'.format(
+        args.date, args.detail))
 
-for auxax in ax_lst:
-    auxax[0].ax.callbacks.connect('xlim_changed', on_xlims_change)
+    for auxax in ax_lst:
+        auxax[0].ax.callbacks.connect('xlim_changed', on_xlims_change)
 
-# ax_lst[0][0].ax.callbacks.connect('xlim_changed', on_xlims_change)
-# ax_lst[0][0].ax.callbacks.connect('ylim_changed', on_ylims_change)
-# ax_lst[0][0].ax.callbacks.connect('ylim_changed', ylim_shout)
+    # ax_lst[0][0].ax.callbacks.connect('xlim_changed', on_xlims_change)
+    # ax_lst[0][0].ax.callbacks.connect('ylim_changed', on_ylims_change)
+    # ax_lst[0][0].ax.callbacks.connect('ylim_changed', ylim_shout)
 
-fig.canvas.mpl_connect('key_press_event', save_zone)
-fig.canvas.mpl_connect('key_press_event', enable_event)
-fig.canvas.mpl_connect('key_press_event', select_zone)
-fig.canvas.mpl_connect('key_press_event', zoom_out)
-fig.canvas.mpl_connect('key_press_event', delete_zone)
+    fig.canvas.mpl_connect('key_press_event', save_zone)
+    fig.canvas.mpl_connect('key_press_event', enable_event)
+    fig.canvas.mpl_connect('key_press_event', select_zone)
+    fig.canvas.mpl_connect('key_press_event', zoom_out)
+    fig.canvas.mpl_connect('key_press_event', delete_zone)
+    fig.canvas.mpl_connect('key_press_event', hot_keys_ref)
 
-# Display plot on separate window
-plt.show()
-
+    # Display plot on separate window
+    plt.show()
